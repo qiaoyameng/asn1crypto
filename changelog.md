@@ -1,5 +1,12 @@
 # changelog
 
+## Unreleased
+
+- Added `pkcs12.inspect_pfx()` for in-memory PKCS#12 inventory checks.
+  Password verification and decryption are supplied by caller callbacks, and
+  results include located issues plus public-key/private-key-presence metadata
+  without private-key contents.
+
 ## 1.5.1
 
  - Handle RSASSA-PSS in `keys.PrivateKeyInfo.bit_size` and
