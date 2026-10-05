@@ -1,6 +1,7 @@
 # coding: utf-8
 from __future__ import unicode_literals, division, absolute_import, print_function
 
+import hashlib
 import unittest
 import os
 import zlib
@@ -1038,4 +1039,296 @@ class CMSTests(unittest.TestCase):
         self.assertEqual(
             'recipient_key_id',
             old_sekp.name,
+        )
+
+
+def _der_len(length):
+    if length < 128:
+        return _bs([length])
+    result = b''
+    while length:
+        result = _bs([length & 0xff]) + result
+        length >>= 8
+    return _bs([0x80 | len(result)]) + result
+
+
+def _bs(ints):
+    return bytes(bytearray(ints))
+
+
+def _tlv(tag, content):
+    return _bs([tag]) + _der_len(len(content)) + content
+
+
+def _seq(*items):
+    return _tlv(0x30, b''.join(items))
+
+
+def _set_of(*items):
+    return _tlv(0x31, b''.join(sorted(items)))
+
+
+def _oid(*content):
+    return _tlv(0x06, _bs(content))
+
+
+def _octet_string(content):
+    return _tlv(0x04, content)
+
+
+def _integer(value):
+    return _tlv(0x02, _bs([value]))
+
+
+def _explicit(number, item):
+    return _tlv(0xa0 + number, item)
+
+
+def _implicit(number, content):
+    return _tlv(0xa0 + number, content)
+
+
+_NULL = b'\x05\x00'
+
+_OID_DATA = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01)
+_OID_SIGNED_DATA = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02)
+_OID_CONTENT_TYPE = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03)
+_OID_MESSAGE_DIGEST = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04)
+_OID_SHA1 = _oid(0x2b, 0x0e, 0x03, 0x02, 0x1a)
+_OID_SHA1_RSA = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05)
+_OID_SHA256_RSA = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b)
+# An unregistered content type OID, used to trigger content type mismatches
+_OID_OTHER_CONTENT = _oid(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x7f)
+
+_CONTENT = b'Hi'
+_CONTENT_DIGEST = hashlib.sha1(_CONTENT).digest()
+_SIGNATURE = b'\x01\x02\x03\x04'
+
+_ATTR_CONTENT_TYPE = _seq(_OID_CONTENT_TYPE, _set_of(_OID_DATA))
+_ATTR_MESSAGE_DIGEST = _seq(_OID_MESSAGE_DIGEST, _set_of(_octet_string(_CONTENT_DIGEST)))
+
+# The DER encoding of the SignedAttrs value with the universal SET OF tag -
+# this is the required signature input per RFC 5652, Section 5.4
+_SIGNED_ATTRS_CONTENT = b''.join(sorted([_ATTR_CONTENT_TYPE, _ATTR_MESSAGE_DIGEST]))
+_EXPECTED_TO_BE_SIGNED = _tlv(0x31, _SIGNED_ATTRS_CONTENT)
+
+
+def _build_signer_info(signed_attrs_content=_SIGNED_ATTRS_CONTENT,
+                       digest_oid=_OID_SHA1,
+                       signature_oid=_OID_SHA1_RSA):
+    fields = [
+        _integer(1),
+        _seq(_seq(), _integer(1)),
+        _seq(digest_oid, _NULL),
+    ]
+    if signed_attrs_content is not None:
+        fields.append(_implicit(0, signed_attrs_content))
+    fields.extend([
+        _seq(signature_oid, _NULL),
+        _octet_string(_SIGNATURE),
+    ])
+    return _seq(*fields)
+
+
+def _build_content_info(content=_CONTENT, content_oid=_OID_DATA, **kwargs):
+    encap_fields = [content_oid]
+    if content is not None:
+        encap_fields.append(_explicit(0, _octet_string(content)))
+    signed_data = _seq(
+        _integer(1),
+        _set_of(_seq(_OID_SHA1, _NULL)),
+        _seq(*encap_fields),
+        _set_of(_build_signer_info(**kwargs)),
+    )
+    return _seq(_OID_SIGNED_DATA, _explicit(0, signed_data))
+
+
+# A fully literal, independently-encoded ContentInfo/SignedData vector
+_SIGNED_DATA_VECTOR = (
+    b'0\x81\xa3\x06\t*\x86H\x86\xf7\r\x01\x07\x02\xa0\x81\x950\x81\x92\x02\x01'
+    b'\x011\x0b0\t\x06\x05+\x0e\x03\x02\x1a\x05\x000\x11\x06\t*\x86H\x86\xf7\r'
+    b'\x01\x07\x01\xa0\x04\x04\x02Hi1m0k\x02\x01\x010\x050\x00\x02\x01\x010\t'
+    b'\x06\x05+\x0e\x03\x02\x1a\x05\x00\xa0?0\x18\x06\t*\x86H\x86\xf7\r\x01\t'
+    b'\x031\x0b\x06\t*\x86H\x86\xf7\r\x01\x07\x010#\x06\t*\x86H\x86\xf7\r\x01'
+    b'\t\x041\x16\x04\x14\x94\xdd\x9e\x08\xc1)\xc7\x85\xf7\xf2V\xe8/\xbe\n0\xe6'
+    b'\xd1\xae@0\r\x06\t*\x86H\x86\xf7\r\x01\x01\x05\x05\x00\x04\x04\x01\x02'
+    b'\x03\x04'
+)
+
+# The expected to-be-signed bytes for _SIGNED_DATA_VECTOR: the DER encoding of
+# the signed attributes with the universal SET OF tag (0x31), not the
+# implicit [0] tag (0xa0) used within the SignerInfo
+_SIGNED_DATA_VECTOR_TO_BE_SIGNED = (
+    b'1?0\x18\x06\t*\x86H\x86\xf7\r\x01\t\x031\x0b\x06\t*\x86H\x86\xf7\r\x01'
+    b'\x07\x010#\x06\t*\x86H\x86\xf7\r\x01\t\x041\x16\x04\x14\x94\xdd\x9e\x08'
+    b'\xc1)\xc7\x85\xf7\xf2V\xe8/\xbe\n0\xe6\xd1\xae@'
+)
+
+
+class VerificationMaterialTests(unittest.TestCase):
+
+    def test_vector_fixture_is_self_consistent(self):
+        self.assertEqual(_SIGNED_DATA_VECTOR, _build_content_info())
+        self.assertEqual(_SIGNED_DATA_VECTOR_TO_BE_SIGNED, _EXPECTED_TO_BE_SIGNED)
+
+    def test_signed_attrs_to_be_signed_uses_set_of_encoding(self):
+        material = cms.extract_verification_material(
+            cms.ContentInfo.load(_SIGNED_DATA_VECTOR)
+        )
+
+        self.assertEqual('data', material.content_type)
+        self.assertEqual(_CONTENT, material.content)
+        self.assertEqual(1, len(material.signers))
+
+        signer = material.signers[0]
+        self.assertEqual(0, signer.index)
+        self.assertEqual('sha1', signer.digest_algorithm)
+        self.assertEqual('sha1_rsa', signer.signature_algorithm)
+        self.assertEqual(_SIGNATURE, signer.signature)
+        self.assertEqual(True, signer.content_digest_match)
+        self.assertEqual([], signer.problems)
+
+        # The signature input must be the DER encoding of the attributes with
+        # the universal SET OF tag, not the raw implicit [0] field
+        self.assertEqual(_SIGNED_DATA_VECTOR_TO_BE_SIGNED, signer.to_be_signed)
+        self.assertEqual(0x31, signer.to_be_signed[0])
+
+    def test_no_signed_attrs_signs_content(self):
+        der = _build_content_info(signed_attrs_content=None)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(_CONTENT, signer.to_be_signed)
+        self.assertEqual(None, signer.content_digest_match)
+        self.assertEqual([], signer.problems)
+
+    def test_no_signed_attrs_requires_data_content_type(self):
+        der = _build_content_info(
+            content_oid=_OID_OTHER_CONTENT,
+            signed_attrs_content=None,
+        )
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['signed_attrs is required when the encapsulated content type is '
+             'not "data"'],
+            signer.problems
+        )
+
+    def test_tampered_content_detected(self):
+        der = _SIGNED_DATA_VECTOR.replace(b'\x04\x02Hi', b'\x04\x02Ho')
+        self.assertNotEqual(_SIGNED_DATA_VECTOR, der)
+
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(False, signer.content_digest_match)
+        self.assertEqual(
+            ['message_digest attribute does not match the digest of the content'],
+            signer.problems
+        )
+
+    def test_duplicate_message_digest_attribute_reported(self):
+        signed_attrs = b''.join(sorted([
+            _ATTR_CONTENT_TYPE,
+            _ATTR_MESSAGE_DIGEST,
+            _ATTR_MESSAGE_DIGEST,
+        ]))
+        der = _build_content_info(signed_attrs_content=signed_attrs)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['duplicate attribute "message_digest" in signed_attrs'],
+            signer.problems
+        )
+
+    def test_missing_content_type_attribute_reported(self):
+        der = _build_content_info(signed_attrs_content=_ATTR_MESSAGE_DIGEST)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['missing required content_type attribute in signed_attrs'],
+            signer.problems
+        )
+
+    def test_missing_message_digest_attribute_reported(self):
+        der = _build_content_info(signed_attrs_content=_ATTR_CONTENT_TYPE)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['missing required message_digest attribute in signed_attrs'],
+            signer.problems
+        )
+
+    def test_content_type_mismatch_reported(self):
+        der = _build_content_info(content_oid=_OID_OTHER_CONTENT)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['content_type attribute "data" does not match the encapsulated '
+             'content type "1.2.840.113549.1.7.127"'],
+            signer.problems
+        )
+
+    def test_incompatible_digest_algorithm_reported(self):
+        der = _build_content_info(signature_oid=_OID_SHA256_RSA)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        self.assertEqual(
+            ['digest_algorithm "sha1" is incompatible with signature_algorithm '
+             '"sha256_rsa", which uses "sha256"'],
+            signer.problems
+        )
+
+    def test_detached_content_unavailable(self):
+        der = _build_content_info(content=None)
+        material = cms.extract_verification_material(cms.ContentInfo.load(der))
+
+        signer = material.signers[0]
+        # The to-be-signed bytes are still available since they only depend
+        # on the signed attributes
+        self.assertEqual(_SIGNED_DATA_VECTOR_TO_BE_SIGNED, signer.to_be_signed)
+        self.assertEqual(None, signer.content_digest_match)
+        self.assertEqual(
+            ['content is detached and no detached_content was provided, so '
+             'the message_digest attribute could not be checked'],
+            signer.problems
+        )
+
+    def test_detached_content_supplied(self):
+        der = _build_content_info(content=None)
+        material = cms.extract_verification_material(
+            cms.ContentInfo.load(der),
+            detached_content=_CONTENT,
+        )
+
+        signer = material.signers[0]
+        self.assertEqual(True, signer.content_digest_match)
+        self.assertEqual([], signer.problems)
+
+    def test_detached_content_switched(self):
+        der = _build_content_info(content=None)
+        material = cms.extract_verification_material(
+            cms.ContentInfo.load(der),
+            detached_content=b'Ho',
+        )
+
+        signer = material.signers[0]
+        self.assertEqual(False, signer.content_digest_match)
+        self.assertEqual(
+            ['message_digest attribute does not match the digest of the content'],
+            signer.problems
+        )
+
+    def test_non_signed_data_rejected(self):
+        info = cms.ContentInfo({'content_type': 'data', 'content': b'test'})
+        self.assertRaises(
+            ValueError,
+            lambda: cms.extract_verification_material(info)
         )

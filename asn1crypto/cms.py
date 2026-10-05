@@ -14,6 +14,9 @@ compatible with PKCS#7. Exports the following items:
  - SignedAndEnvelopedData()
  - SignedData()
 
+In addition, extract_verification_material() assembles the inputs a
+signature verifier needs from a SignedData structure.
+
 Other type classes are defined that help compose the types listed above.
 
 Most CMS structures in the wild are formatted as ContentInfo encapsulating one of the other types.
@@ -21,11 +24,14 @@ Most CMS structures in the wild are formatted as ContentInfo encapsulating one o
 
 from __future__ import unicode_literals, division, absolute_import, print_function
 
+import hashlib
+
 try:
     import zlib
 except (ImportError):
     zlib = None
 
+from ._errors import unwrap
 from .algos import (
     _ForceNullParameters,
     DigestAlgorithm,
@@ -52,10 +58,12 @@ from .core import (
     SetOf,
     UTCTime,
     UTF8String,
+    type_name,
 )
 from .crl import CertificateList
 from .keys import PublicKeyInfo
 from .ocsp import OCSPResponse
+from .parser import _dump_header
 from .x509 import Attributes, Certificate, Extensions, GeneralName, GeneralNames, Name
 
 
@@ -1006,3 +1014,378 @@ CMSAttribute._oid_specs = {
     'encrypt_key_pref': SMIMEEncryptionKeyPreferences,
     'smime_capabilities': SetOfSMIMECapabilites,
 }
+
+
+class SignerVerificationMaterial(object):
+    """
+    Verification material extracted from a single SignerInfo of a SignedData
+    structure.
+
+    This class only assembles the inputs a signature verifier needs. A
+    successfully-populated instance does NOT mean the signature is valid -
+    determining validity requires cryptographic verification by separate
+    verifier code, plus trust path validation of the signer's certificate.
+    """
+
+    # The zero-based index of the SignerInfo within SignedData.signer_infos
+    index = None
+
+    # The native value of the SignerIdentifier, for locating the signer cert
+    sid = None
+
+    # A unicode string of the digest algorithm name, e.g. "sha256"
+    digest_algorithm = None
+
+    # A unicode string of the signature algorithm name, e.g. "sha256_rsa"
+    signature_algorithm = None
+
+    # The native value of the signature algorithm parameters, or None
+    signature_algorithm_parameters = None
+
+    # A byte string of the signature value from the SignerInfo
+    signature = None
+
+    # A byte string of the exact input for the signature verifier, or None if
+    # it could not be determined - see .problems for the reason
+    to_be_signed = None
+
+    # True if the messageDigest signed attribute matches the digest of the
+    # content, False if it does not, or None if no check was performed (no
+    # signed attributes, or the content was unavailable)
+    content_digest_match = None
+
+    # A list of unicode strings describing problems found while extracting.
+    # Any entry here means the signature MUST NOT be considered valid without
+    # further investigation.
+    problems = None
+
+    def __init__(self):
+        self.problems = []
+
+    def __repr__(self):
+        return '<SignerVerificationMaterial %s: digest_algorithm=%s, ' \
+            'signature_algorithm=%s, content_digest_match=%s, problems=%d>' % (
+                self.index,
+                self.digest_algorithm,
+                self.signature_algorithm,
+                self.content_digest_match,
+                len(self.problems),
+            )
+
+
+class SignedDataVerificationMaterial(object):
+    """
+    Verification material extracted from a SignedData structure.
+
+    This class only assembles the inputs a signature verifier needs. A
+    successfully-populated instance does NOT mean any signature is valid.
+    """
+
+    # A unicode string of the encapsulated content type, e.g. "data"
+    content_type = None
+
+    # A byte string of the content that was digested - either the embedded
+    # content or the detached content supplied by the caller. None if the
+    # content was detached and no detached content was provided.
+    content = None
+
+    # A list of SignerVerificationMaterial objects, one per SignerInfo
+    signers = None
+
+    def __init__(self):
+        self.signers = []
+
+    def __repr__(self):
+        return '<SignedDataVerificationMaterial: content_type=%s, signers=%d>' % (
+            self.content_type,
+            len(self.signers),
+        )
+
+
+def _content_bytes(content_value):
+    """
+    Extracts the byte string that the message digest is computed over from an
+    EncapsulatedContentInfo/ContentInfo content field
+
+    :param content_value:
+        An Asn1Value object - the "content" field of the
+        EncapsulatedContentInfo or ContentInfo
+
+    :return:
+        A byte string, or None if the content is absent (detached)
+    """
+
+    if content_value.native is None:
+        return None
+
+    # CMS wraps the content in an Octet String - the digest input is the
+    # content octets of that Octet String
+    if isinstance(content_value, ParsableOctetString):
+        return content_value.__bytes__()
+
+    # An unrecognized content type stays unparsed - parse it generically
+    if isinstance(content_value, Any):
+        content_value = content_value.parsed
+
+    # PKCS#7 SignedData carries the content directly
+    if isinstance(content_value, OctetString):
+        return content_value.native
+
+    # For non-data content types, the digest input is the DER encoding of
+    # the content value
+    return content_value.dump()
+
+
+def _compute_digest(digest_algorithm, data):
+    """
+    Computes a message digest using hashlib
+
+    :param digest_algorithm:
+        A unicode string of the digest algorithm name, e.g. "sha256"
+
+    :param data:
+        A byte string to digest
+
+    :return:
+        A byte string of the digest, or None if the algorithm is not
+        supported by hashlib
+    """
+
+    try:
+        digest = hashlib.new(digest_algorithm)
+        digest.update(data)
+        return digest.digest()
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_verification_material(content_info, detached_content=None):
+    """
+    Extracts the material required to verify each SignerInfo of a CMS
+    SignedData structure - the to-be-signed bytes, the algorithm parameters
+    and the result of checking the content against the messageDigest signed
+    attribute.
+
+    This function only assembles verification inputs and reports structural
+    problems. It does NOT verify any signature, and a result without problems
+    does NOT imply any signature is valid.
+
+    Supports both embedded and detached content. When the SignedData contains
+    no embedded content, the content must be supplied via detached_content,
+    otherwise the messageDigest attribute can not be checked and, for
+    SignerInfos without signed attributes, the to-be-signed bytes can not be
+    determined.
+
+    :param content_info:
+        An asn1crypto.cms.ContentInfo object with a content_type of
+        "signed_data", or an asn1crypto.cms.SignedData object
+
+    :param detached_content:
+        A byte string of the detached content. Only used when the SignedData
+        does not embed the content.
+
+    :raises:
+        TypeError - when a parameter is of the wrong type
+        ValueError - when content_info does not contain SignedData
+
+    :return:
+        A SignedDataVerificationMaterial object
+    """
+
+    if isinstance(content_info, ContentInfo):
+        if content_info['content_type'].native != 'signed_data':
+            raise ValueError(unwrap(
+                '''
+                content_info must contain SignedData, not %s
+                ''',
+                content_info['content_type'].native
+            ))
+        signed_data = content_info['content']
+    elif isinstance(content_info, SignedData):
+        signed_data = content_info
+    else:
+        raise TypeError(unwrap(
+            '''
+            content_info must be an asn1crypto.cms.ContentInfo or
+            asn1crypto.cms.SignedData object, not %s
+            ''',
+            type_name(content_info)
+        ))
+
+    if detached_content is not None and not isinstance(detached_content, bytes):
+        raise TypeError(unwrap(
+            '''
+            detached_content must be a byte string, not %s
+            ''',
+            type_name(detached_content)
+        ))
+
+    encap_content_info = signed_data['encap_content_info']
+    content_type = encap_content_info['content_type'].native
+    content = _content_bytes(encap_content_info['content'])
+    if content is None:
+        content = detached_content
+
+    result = SignedDataVerificationMaterial()
+    result.content_type = content_type
+    result.content = content
+
+    for index, signer_info in enumerate(signed_data['signer_infos']):
+        material = SignerVerificationMaterial()
+        material.index = index
+        material.sid = signer_info['sid'].native
+
+        digest_algorithm = signer_info['digest_algorithm']['algorithm'].native
+        material.digest_algorithm = digest_algorithm
+
+        signature_algorithm = signer_info['signature_algorithm']
+        material.signature_algorithm = signature_algorithm['algorithm'].native
+        material.signature_algorithm_parameters = \
+            signature_algorithm['parameters'].native
+        material.signature = signer_info['signature'].native
+
+        # The digest algorithm stated in the SignerInfo must be compatible
+        # with the signature algorithm - e.g. sha256_rsa requires sha256, and
+        # RSASSA-PSS requires the hash from its parameters
+        try:
+            implied_digest = signature_algorithm.cms_hash_algo
+        except (ValueError, TypeError):
+            implied_digest = None
+        if implied_digest is not None and implied_digest != digest_algorithm:
+            material.problems.append(unwrap(
+                '''
+                digest_algorithm "%s" is incompatible with
+                signature_algorithm "%s", which uses "%s"
+                ''',
+                digest_algorithm,
+                material.signature_algorithm,
+                implied_digest
+            ))
+
+        signed_attrs = signer_info['signed_attrs']
+        if signed_attrs.native is not None:
+            _process_signed_attrs(signer_info, signed_attrs, content_type,
+                                  content, digest_algorithm, material)
+        else:
+            if content_type != 'data':
+                material.problems.append(
+                    'signed_attrs is required when the encapsulated content '
+                    'type is not "data"'
+                )
+            if content is None:
+                material.problems.append(
+                    'content is detached and no detached_content was '
+                    'provided, so the to-be-signed bytes could not be '
+                    'determined'
+                )
+            else:
+                # Without signed attributes, the signature input is the
+                # content itself
+                material.to_be_signed = content
+
+        result.signers.append(material)
+
+    return result
+
+
+def _process_signed_attrs(signer_info, signed_attrs, content_type, content,
+                          digest_algorithm, material):
+    """
+    Populates a SignerVerificationMaterial from the signed attributes of a
+    SignerInfo
+
+    :param signer_info:
+        A SignerInfo object
+
+    :param signed_attrs:
+        The CMSAttributes object from the SignerInfo
+
+    :param content_type:
+        A unicode string of the encapsulated content type
+
+    :param content:
+        A byte string of the content, or None if unavailable
+
+    :param digest_algorithm:
+        A unicode string of the digest algorithm name
+
+    :param material:
+        A SignerVerificationMaterial object to populate
+    """
+
+    # The signature input is the DER encoding of the SignedAttrs value with
+    # the universal SET OF tag - not the implicit [0] tag from the SignerInfo
+    # encoding (RFC 5652, Section 5.4)
+    contents = signed_attrs.contents
+    material.to_be_signed = _dump_header(0, 1, 17, contents) + contents
+
+    seen = set()
+    content_type_values = None
+    message_digest_values = None
+    for attr in signed_attrs:
+        attr_type = attr['type'].native
+        if attr_type in seen:
+            material.problems.append(
+                'duplicate attribute "%s" in signed_attrs' % attr_type
+            )
+            continue
+        seen.add(attr_type)
+        if attr_type == 'content_type':
+            content_type_values = attr['values']
+        elif attr_type == 'message_digest':
+            message_digest_values = attr['values']
+
+    # RFC 5652, Section 11.1 - the content-type attribute is required
+    if content_type_values is None:
+        material.problems.append(
+            'missing required content_type attribute in signed_attrs'
+        )
+    elif len(content_type_values) != 1:
+        material.problems.append(
+            'content_type attribute must contain exactly one value'
+        )
+    elif content_type_values[0].native != content_type:
+        material.problems.append(unwrap(
+            '''
+            content_type attribute "%s" does not match the encapsulated
+            content type "%s"
+            ''',
+            content_type_values[0].native,
+            content_type
+        ))
+
+    # RFC 5652, Section 11.2 - the message-digest attribute is required
+    if message_digest_values is None:
+        material.problems.append(
+            'missing required message_digest attribute in signed_attrs'
+        )
+        return
+
+    if len(message_digest_values) != 1:
+        material.problems.append(
+            'message_digest attribute must contain exactly one value'
+        )
+        return
+
+    expected_digest = message_digest_values[0].native
+    if content is None:
+        material.problems.append(
+            'content is detached and no detached_content was provided, so '
+            'the message_digest attribute could not be checked'
+        )
+        return
+
+    actual_digest = _compute_digest(digest_algorithm, content)
+    if actual_digest is None:
+        material.problems.append(
+            'unsupported digest_algorithm "%s", so the message_digest '
+            'attribute could not be checked' % digest_algorithm
+        )
+        return
+
+    material.content_digest_match = actual_digest == expected_digest
+    if not material.content_digest_match:
+        material.problems.append(
+            'message_digest attribute does not match the digest of the '
+            'content'
+        )
