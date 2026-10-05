@@ -164,6 +164,7 @@ links to the source for the various pre-defined type classes.
  - [Digest, HMAC, signed digest and encryption algorithms](asn1crypto/algos.py), `asn1crypto.algos`
  - [Private and public keys](asn1crypto/keys.py), `asn1crypto.keys`
  - [X509 certificates](asn1crypto/x509.py), `asn1crypto.x509`
+ - [Candidate X.509 certification paths](asn1crypto/x509_path.py), `asn1crypto.x509_path`
  - [Certificate revocation lists (CRLs)](asn1crypto/crl.py), `asn1crypto.crl`
  - [Online certificate status protocol (OCSP)](asn1crypto/ocsp.py), `asn1crypto.ocsp`
  - [Certificate signing requests (CSRs)](asn1crypto/csr.py), `asn1crypto.csr`
