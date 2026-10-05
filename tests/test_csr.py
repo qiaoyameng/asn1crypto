@@ -1,11 +1,12 @@
 # coding: utf-8
 from __future__ import unicode_literals, division, absolute_import, print_function
 
+import hashlib
 import unittest
 import sys
 import os
 
-from asn1crypto import csr, util
+from asn1crypto import algos, csr, keys, util, x509
 from ._unittest_compat import patch
 
 patch()
@@ -250,3 +251,295 @@ class CSRTests(unittest.TestCase):
             ],
             cri['attributes'].native
         )
+
+
+# A static 1024-bit RSA key pair used only by these tests to produce CSRs
+# with verifiable signatures without requiring a crypto library.
+_TEST_RSA_N = 151849606045680612989746556309638398717477723759051839918442825203961369414414499091920115651981722594077834216037391113450469664323410763416578982702053578347473160171257091825153807275057984219383617284123741766409170179863002846698472138872429360177939524580055389986404399689127347330675404427720647415923  # noqa
+_TEST_RSA_E = 65537
+_TEST_RSA_D = 129242580911974374667257624104729082510046346815995721968517643314112107449777084079944215497620282989725828044777235398450756029051678477552783552117438198658606923276647801490423197788793034681151167457375897215731167099056196244500483756671729533645428682214329191430780811204840719171476054801373231367393  # noqa
+
+_SHA256_DIGEST_INFO_PREFIX = bytearray.fromhex('30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20')  # noqa
+
+
+def _rsa_pkcs1_em(cri_bytes):
+    digest_info = _SHA256_DIGEST_INFO_PREFIX + bytearray(hashlib.sha256(cri_bytes).digest())
+    key_bytes = (_TEST_RSA_N.bit_length() + 7) // 8
+    padding = bytearray(b'\xff') * (key_bytes - len(digest_info) - 3)
+    return b'\x00\x01' + bytes(padding) + b'\x00' + bytes(digest_info)
+
+
+def _rsa_sign(cri_bytes):
+    sig_int = pow(util.int_from_bytes(_rsa_pkcs1_em(cri_bytes)), _TEST_RSA_D, _TEST_RSA_N)
+    return util.int_to_bytes(sig_int, width=(_TEST_RSA_N.bit_length() + 7) // 8)
+
+
+def _rsa_verify(cri_bytes, signature):
+    sig_int = util.int_from_bytes(signature)
+    em = util.int_to_bytes(pow(sig_int, _TEST_RSA_E, _TEST_RSA_N), width=(_TEST_RSA_N.bit_length() + 7) // 8)
+    return em == _rsa_pkcs1_em(cri_bytes)
+
+
+def _test_public_key_info():
+    return keys.PublicKeyInfo({
+        'algorithm': {'algorithm': 'rsa'},
+        'public_key': keys.RSAPublicKey({
+            'modulus': _TEST_RSA_N,
+            'public_exponent': _TEST_RSA_E,
+        }),
+    })
+
+
+def _extension_request_attribute(extensions):
+    attribute = csr.CRIAttribute()
+    attribute['type'] = 'extension_request'
+    attribute['values'] = csr.SetOfExtensions([x509.Extensions(extensions)])
+    return attribute
+
+
+def _build_csr(extension_requests, tamper_signature=False):
+    cri = csr.CertificationRequestInfo({
+        'version': 'v1',
+        'subject': x509.Name.build({'common_name': 'eval-test.example'}),
+        'subject_pk_info': _test_public_key_info(),
+        'attributes': csr.CRIAttributes([
+            _extension_request_attribute(extensions)
+            for extensions in extension_requests
+        ]),
+    })
+    signature = _rsa_sign(cri.dump())
+    if tamper_signature:
+        signature = signature[:-1] + bytes(bytearray([signature[-1] ^ 0x01]))
+    return csr.CertificationRequest({
+        'certification_request_info': cri,
+        'signature_algorithm': algos.SignedDigestAlgorithm({'algorithm': 'sha256_rsa'}),
+        'signature': signature,
+    })
+
+
+def _verifying_callback(cri_bytes, signature_algorithm, signature):
+    if signature_algorithm['algorithm'].native != 'sha256_rsa':
+        return False
+    return _rsa_verify(cri_bytes, signature)
+
+
+class CSREvaluationTests(unittest.TestCase):
+
+    def _leaf_policy(self, **kwargs):
+        return csr.CSREvaluationPolicy(
+            allowed_extensions=['subject_alt_name', 'key_usage', 'basic_constraints'],
+            **kwargs
+        )
+
+    def test_evaluate_valid_request(self):
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'subject_alt_name',
+                'extn_value': x509.GeneralNames([x509.GeneralName('dns_name', 'eval-test.example')]),
+            }),
+            x509.Extension({
+                'extn_id': 'key_usage',
+                'critical': True,
+                'extn_value': x509.KeyUsage(set(['digital_signature'])),
+            }),
+        ]])
+
+        seen = {}
+
+        def callback(cri_bytes, signature_algorithm, signature):
+            seen['cri_bytes'] = cri_bytes
+            seen['algorithm'] = signature_algorithm
+            return _verifying_callback(cri_bytes, signature_algorithm, signature)
+
+        result = csr.evaluate_certification_request(request, callback, self._leaf_policy())
+
+        # The callback received the original encoded CertificationRequestInfo
+        self.assertEqual(
+            request['certification_request_info'].dump(),
+            seen['cri_bytes']
+        )
+        self.assertEqual('sha256_rsa', seen['algorithm']['algorithm'].native)
+
+        self.assertEqual('eval-test.example', result.subject.native['common_name'])
+        self.assertEqual('rsa', result.public_key['algorithm'].native['algorithm'])
+        self.assertEqual(2, len(result.extensions))
+
+        san, key_usage = result.extensions
+        self.assertEqual('2.5.29.17', san.oid)
+        self.assertEqual('subject_alt_name', san.name)
+        self.assertEqual(False, san.critical)
+        self.assertEqual(['eval-test.example'], san.value.parsed.native)
+        self.assertEqual(csr.ExtensionSource('extension_request', 0, 0), san.source)
+        self.assertEqual('2.5.29.15', key_usage.oid)
+        self.assertEqual(True, key_usage.critical)
+        self.assertEqual(csr.ExtensionSource('extension_request', 0, 1), key_usage.source)
+
+    def test_evaluate_rejects_bad_signature(self):
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'key_usage',
+                'extn_value': x509.KeyUsage(set(['digital_signature'])),
+            }),
+        ]], tamper_signature=True)
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual('signature', cm.exception.stage)
+
+    def test_evaluate_rejects_callback_exception(self):
+        request = _build_csr([[]])
+
+        def callback(cri_bytes, signature_algorithm, signature):
+            raise RuntimeError('boom')
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, callback, self._leaf_policy())
+
+        self.assertEqual('signature', cm.exception.stage)
+
+    def test_evaluate_rejects_ca_request(self):
+        # A validly-signed request asking for CA privileges and a key usage
+        # that conflicts with them
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'basic_constraints',
+                'critical': True,
+                'extn_value': x509.BasicConstraints({'ca': True, 'path_len_constraint': 0}),
+            }),
+            x509.Extension({
+                'extn_id': 'key_usage',
+                'critical': True,
+                'extn_value': x509.KeyUsage(set(['digital_signature'])),
+            }),
+        ]])
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual('extensions', cm.exception.stage)
+        self.assertIn('CA', str(cm.exception))
+
+    def test_evaluate_rejects_ca_key_usage_combination(self):
+        # CA key usages requested without CA basic constraints
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'key_usage',
+                'critical': True,
+                'extn_value': x509.KeyUsage(set(['key_cert_sign', 'crl_sign'])),
+            }),
+        ]])
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual('extensions', cm.exception.stage)
+
+    def test_evaluate_allows_ca_with_explicit_policy(self):
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'basic_constraints',
+                'critical': True,
+                'extn_value': x509.BasicConstraints({'ca': True}),
+            }),
+            x509.Extension({
+                'extn_id': 'key_usage',
+                'critical': True,
+                'extn_value': x509.KeyUsage(set(['key_cert_sign', 'crl_sign'])),
+            }),
+        ]])
+
+        policy = self._leaf_policy(allow_ca=True)
+        result = csr.evaluate_certification_request(request, _verifying_callback, policy)
+
+        self.assertEqual(2, len(result.extensions))
+
+    def test_evaluate_rejects_duplicate_extension_request(self):
+        # Two extensionRequest attributes, the second smuggling in a
+        # conflicting CA constraint
+        request = _build_csr([
+            [
+                x509.Extension({
+                    'extn_id': 'subject_alt_name',
+                    'extn_value': x509.GeneralNames([x509.GeneralName('dns_name', 'eval-test.example')]),
+                }),
+            ],
+            [
+                x509.Extension({
+                    'extn_id': 'basic_constraints',
+                    'critical': True,
+                    'extn_value': x509.BasicConstraints({'ca': True}),
+                }),
+            ],
+        ])
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual('attributes', cm.exception.stage)
+
+    def test_evaluate_rejects_unknown_critical_extension(self):
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': '1.2.3.4',
+                'critical': True,
+                'extn_value': b'\x05\x00',
+            }),
+        ]])
+
+        with self.assertRaises(csr.CSREvaluationError) as cm:
+            csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual('extensions', cm.exception.stage)
+
+    def test_evaluate_drops_unknown_noncritical_extension(self):
+        request = _build_csr([[
+            x509.Extension({
+                'extn_id': 'subject_alt_name',
+                'extn_value': x509.GeneralNames([x509.GeneralName('dns_name', 'eval-test.example')]),
+            }),
+            x509.Extension({
+                'extn_id': '1.2.3.4',
+                'extn_value': b'\x05\x00',
+            }),
+        ]])
+
+        result = csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+        self.assertEqual(1, len(result.extensions))
+        self.assertEqual('2.5.29.17', result.extensions[0].oid)
+
+    def test_evaluation_errors_do_not_leak_key_or_request(self):
+        requests = [
+            _build_csr([[
+                x509.Extension({
+                    'extn_id': 'basic_constraints',
+                    'critical': True,
+                    'extn_value': x509.BasicConstraints({'ca': True}),
+                }),
+            ]]),
+            _build_csr([
+                [x509.Extension({
+                    'extn_id': 'key_usage',
+                    'extn_value': x509.KeyUsage(set(['digital_signature'])),
+                })],
+                [x509.Extension({
+                    'extn_id': 'subject_alt_name',
+                    'extn_value': x509.GeneralNames([x509.GeneralName('dns_name', 'eval-test.example')]),
+                })],
+            ]),
+        ]
+
+        for request in requests:
+            with self.assertRaises(csr.CSREvaluationError) as cm:
+                csr.evaluate_certification_request(request, _verifying_callback, self._leaf_policy())
+
+            message = str(cm.exception)
+            # No private key material
+            self.assertNotIn(str(_TEST_RSA_D), message)
+            # No part of the encoded request body
+            self.assertNotIn(request.dump().hex(), message)
+            self.assertNotIn(
+                request['certification_request_info'].dump().hex(),
+                message
+            )
