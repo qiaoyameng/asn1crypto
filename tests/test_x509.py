@@ -485,6 +485,65 @@ class X509Tests(unittest.TestCase):
         self.assertEqual("unique_identifier", complex_name.chosen[3][0]['type'].native)
         self.assertIsInstance(complex_name.chosen[3][0]['value'], core.OctetBitString)
 
+    def test_build_rfc4514_multi_valued_rdn_grouping(self):
+        grouped = x509.Name.build_rfc4514('CN=Will Bond+O=Codex,OU=Engineering')
+        separated = x509.Name.build_rfc4514('CN=Will Bond,O=Codex+OU=Engineering')
+
+        self.assertEqual(2, len(grouped.chosen))
+        self.assertEqual(2, len(grouped.chosen[0]))
+        self.assertEqual(1, len(grouped.chosen[1]))
+        self.assertEqual(2, len(separated.chosen))
+        self.assertEqual(1, len(separated.chosen[0]))
+        self.assertEqual(2, len(separated.chosen[1]))
+        self.assertNotEqual(grouped, separated)
+        self.assertEqual(grouped.human_friendly, separated.human_friendly)
+        self.assertEqual(
+            'CN=Will Bond+O=Codex,OU=Engineering',
+            grouped.rfc4514_string
+        )
+        self.assertEqual(
+            'CN=Will Bond,O=Codex+OU=Engineering',
+            separated.rfc4514_string
+        )
+
+    def test_build_rfc4514_roundtrip(self):
+        distinguished_name = (
+            'CN=\\20\\+\\20,O=组织,'
+            'OU=#0c06e4b8ade69687,'
+            '2.5.4.3=,1.2.3.4=#0c0178'
+        )
+        name = x509.Name.build_rfc4514(distinguished_name)
+
+        self.assertEqual(5, len(name.chosen))
+        self.assertEqual(' + ', name.chosen[0][0]['value'].native)
+        self.assertEqual('组织', name.chosen[1][0]['value'].native)
+        self.assertEqual('中文', name.chosen[2][0]['value'].native)
+        self.assertEqual('', name.chosen[3][0]['value'].native)
+        self.assertEqual(b'\x0c\x01x', name.chosen[4][0]['value'].dump())
+        self.assertEqual(
+            'CN=\\20\\+\\20,O=组织,OU=#0c06e4b8ade69687,CN=,1.2.3.4=#0c0178',
+            name.rfc4514_string
+        )
+        self.assertEqual(name, x509.Name.build_rfc4514(name.rfc4514_string))
+
+    def test_build_rfc4514_unknown_oid_requires_der(self):
+        with self.assertRaises(ValueError) as cm:
+            x509.Name.build_rfc4514('1.2.3.4=value')
+
+        self.assertEqual(8, cm.exception.position)
+
+        name = x509.Name.build_rfc4514('1.2.3.4=#0c0178')
+        self.assertIsInstance(name.chosen[0][0]['value'].parsed, core.UTF8String)
+        self.assertEqual('1.2.3.4=#0c0178', name.rfc4514_string)
+
+    def test_build_rfc4514_error_position(self):
+        distinguished_name = 'CN=foo+bar'
+
+        with self.assertRaises(ValueError) as cm:
+            x509.Name.build_rfc4514(distinguished_name)
+
+        self.assertEqual(7, cm.exception.position)
+
     def test_name_hashable(self):
         complex_name = x509.Name.build(
             {

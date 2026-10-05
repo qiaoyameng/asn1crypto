@@ -15,6 +15,7 @@ Other type classes are defined that help compose the types listed above.
 
 from __future__ import unicode_literals, division, absolute_import, print_function
 
+import binascii
 from contextlib import contextmanager
 from encodings import idna  # noqa
 import hashlib
@@ -27,10 +28,11 @@ import unicodedata
 from ._errors import unwrap
 from ._iri import iri_to_uri, uri_to_iri
 from ._ordereddict import OrderedDict
-from ._types import type_name, str_cls, byte_cls, bytes_to_list
+from ._types import type_name, str_cls, byte_cls, bytes_to_list, chr_cls
 from .algos import AlgorithmIdentifier, AnyAlgorithmIdentifier, DigestAlgorithm, SignedDigestAlgorithm
 from .core import (
     Any,
+    Asn1Value,
     BitString,
     BMPString,
     Boolean,
@@ -41,6 +43,7 @@ from .core import (
     GeneralString,
     IA5String,
     Integer,
+    load as load_der,
     Null,
     NumericString,
     ObjectIdentifier,
@@ -696,6 +699,7 @@ class NameTypeAndValue(Sequence):
     }
 
     _prepped = None
+    _rfc4514_hex = None
 
     @property
     def prepped_value(self):
@@ -846,6 +850,244 @@ class NameTypeAndValue(Sequence):
         string = ' ' + re.sub(' +', '  ', string).strip() + ' '
 
         return string
+
+
+_RFC4514_KEYWORDS = {
+    'CN': '2.5.4.3',
+    'L': '2.5.4.7',
+    'ST': '2.5.4.8',
+    'O': '2.5.4.10',
+    'OU': '2.5.4.11',
+    'C': '2.5.4.6',
+    'STREET': '2.5.4.9',
+    'DC': '0.9.2342.19200300.100.1.25',
+    'UID': '0.9.2342.19200300.100.1.1',
+}
+
+_RFC4514_ATTRIBUTE_KEYWORDS = {
+    'common_name': 'CN',
+    'locality_name': 'L',
+    'state_or_province_name': 'ST',
+    'organization_name': 'O',
+    'organizational_unit_name': 'OU',
+    'country_name': 'C',
+    'street_address': 'STREET',
+    'domain_component': 'DC',
+    'user_id': 'UID',
+}
+
+
+class _RFC4514ParseError(ValueError):
+
+    position = None
+
+    def __init__(self, message, position):
+        super(_RFC4514ParseError, self).__init__(message)
+        self.position = position
+
+
+def _rfc4514_error(dn, position, message):
+    pointer = ' ' * position + '^'
+    raise _RFC4514ParseError(
+        'Invalid RFC 4514 distinguished name at position %d: %s\n%s\n%s' % (
+            position,
+            message,
+            dn,
+            pointer
+        ),
+        position
+    )
+
+
+def _rfc4514_skip_spaces(data, pos):
+    while pos < len(data) and data[pos] == ' ':
+        pos += 1
+    return pos
+
+
+def _rfc4514_attribute_type(data, pos):
+    start = pos
+    while pos < len(data):
+        char = data[pos]
+        if char.isalnum() or char in ('.', '-'):
+            pos += 1
+            continue
+        if char in (' ', '='):
+            break
+        _rfc4514_error(data, pos, 'unexpected character %s' % repr(char))
+
+    if pos == start:
+        _rfc4514_error(data, pos, 'missing attribute type')
+
+    raw_type = data[start:pos]
+    if raw_type[0].isdigit():
+        if not re.match(r'^\d+(\.\d+)+$', raw_type):
+            _rfc4514_error(data, start, 'invalid dotted-object-identifier')
+        try:
+            NameType(raw_type)
+        except (ValueError, TypeError):
+            _rfc4514_error(data, start, 'invalid object identifier')
+        oid = raw_type
+    else:
+        oid = _RFC4514_KEYWORDS.get(raw_type.upper())
+        if oid is None:
+            _rfc4514_error(data, start, 'unknown attribute type keyword')
+
+    return oid, pos
+
+
+def _rfc4514_parse_hex_value(data, pos):
+    start = pos
+    hex_chars = []
+    while pos < len(data) and data[pos] in '0123456789abcdefABCDEF':
+        hex_chars.append(data[pos])
+        pos += 1
+
+    if pos < len(data) and data[pos] not in (',', '+', ';', ' '):
+        _rfc4514_error(data, pos, 'unexpected character in hexadecimal DER value')
+
+    if not hex_chars:
+        _rfc4514_error(data, pos, 'missing hexadecimal DER value')
+    if len(hex_chars) % 2:
+        _rfc4514_error(data, pos - 1, 'incomplete hexadecimal escape')
+
+    try:
+        value_bytes = binascii.unhexlify(''.join(hex_chars).encode('ascii'))
+        value = load_der(value_bytes, strict=True)
+    except (ValueError, TypeError):
+        _rfc4514_error(data, start - 1, 'value is not valid DER')
+
+    if value.dump(force=True) != value_bytes:
+        _rfc4514_error(data, start - 1, 'value is not in DER form')
+
+    return value, pos
+
+
+def _rfc4514_parse_string_value(data, pos):
+    chunks = []
+    start = pos
+    collecting_spaces = False
+
+    while pos < len(data):
+        char = data[pos]
+
+        if char == '\\':
+            next_pos = pos + 1
+            if next_pos >= len(data):
+                _rfc4514_error(data, pos, 'incomplete escape sequence')
+            escaped = data[next_pos]
+            if escaped in '0123456789abcdefABCDEF' and next_pos + 1 < len(data) and \
+                    data[next_pos + 1] in '0123456789abcdefABCDEF':
+                try:
+                    byte = chr_cls(int(data[next_pos:next_pos + 2], 16))
+                    if not isinstance(byte, byte_cls):
+                        byte = byte.encode('latin1')
+                except (ValueError, OverflowError):
+                    _rfc4514_error(data, next_pos, 'invalid hexadecimal escape')
+                chunks.append(('escaped', byte))
+                pos = next_pos + 2
+            elif escaped in (',', '+', '"', '\\', '<', '>', ';', '=', '#', ' '):
+                chunks.append(('escaped', escaped.encode('latin1')))
+                pos = next_pos + 1
+            else:
+                _rfc4514_error(data, next_pos, 'invalid escaped character')
+            collecting_spaces = False
+            continue
+
+        if char in (',', '+', ';'):
+            break
+        if char in ('"', '<', '>', '\0'):
+            _rfc4514_error(data, pos, 'unescaped special character %s' % repr(char))
+
+        if char == '#' and pos == start:
+            _rfc4514_error(data, pos, 'literal octothorpe must be escaped')
+
+        if char == ' ':
+            if not collecting_spaces:
+                chunks.append(['spaces', []])
+                collecting_spaces = True
+            chunks[-1][1].append(b' ')
+            pos += 1
+        else:
+            collecting_spaces = False
+            chunks.append(('text', char.encode('utf-8')))
+            pos += 1
+
+    while chunks and chunks[-1][0] == 'spaces':
+        chunks.pop()
+
+    value_bytes = b''.join(
+        chunk if chunk_type == 'escaped' else b''.join(chunk) if chunk_type == 'spaces' else chunk
+        for chunk_type, chunk in chunks
+    )
+
+    try:
+        value_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        _rfc4514_error(data, start, 'value is not valid UTF-8')
+
+    return value_bytes.decode('utf-8'), pos
+
+
+def _rfc4514_build_value(attribute_name, value, data, position, use_hex=False):
+    attribute_class = NameTypeAndValue._oid_specs.get(attribute_name)
+
+    try:
+        if isinstance(value, Asn1Value):
+            if attribute_name not in NameTypeAndValue._oid_specs:
+                encoded_value = Any(value)
+            else:
+                encoded_value = value
+        elif attribute_class is None:
+            _rfc4514_error(
+                data,
+                position,
+                'unknown attribute types require a hexadecimal DER value'
+            )
+        else:
+            if attribute_class is DirectoryString:
+                encoding_name = 'printable_string' if attribute_name in (
+                    'dn_qualifier',
+                    'country_name',
+                    'serial_number'
+                ) else 'utf8_string'
+                encoded_value = DirectoryString(
+                    name=encoding_name,
+                    value=(PrintableString if encoding_name == 'printable_string' else UTF8String)(value)
+                )
+            else:
+                encoded_value = attribute_class(value)
+
+        type_value = NameTypeAndValue({'type': attribute_name, 'value': encoded_value})
+    except _RFC4514ParseError:
+        raise
+    except (ValueError, TypeError):
+        _rfc4514_error(data, position, 'value is not valid for the attribute type')
+
+    if use_hex:
+        type_value._rfc4514_hex = True
+    return type_value
+
+
+def _rfc4514_escape_value(value):
+    if value == '':
+        return value
+
+    output = []
+    for index, char in enumerate(value):
+        if char in (',', '+', '"', '\\', '<', '>', ';'):
+            output.append('\\' + char)
+        elif ord(char) < 0x20 or ord(char) == 0x7f:
+            output.append('\\%02x' % ord(char))
+        else:
+            output.append(char)
+
+    if value[0] in (' ', '#'):
+        output[0] = '\\%02x' % ord(value[0]) if value[0] == ' ' else '\\#'
+    if value[-1] == ' ':
+        output[-1] = '\\20'
+
+    return ''.join(output)
 
 
 class RelativeDistinguishedName(SetOf):
@@ -1056,6 +1298,169 @@ class Name(Choice):
             ]))
 
         return cls(name='', value=RDNSequence(rdns))
+
+    @classmethod
+    def build_rfc4514(cls, distinguished_name):
+        """
+        Creates a Name object from an RFC 4514 distinguished name string.
+
+        :param distinguished_name:
+            A unicode string in RFC 4514 form
+
+        :return:
+            An x509.Name object
+        """
+
+        if isinstance(distinguished_name, byte_cls):
+            data = distinguished_name.decode('utf-8')
+        elif not isinstance(distinguished_name, str_cls):
+            raise TypeError(unwrap(
+                '''
+                distinguished_name must be a unicode string, not %s
+                ''',
+                type_name(distinguished_name)
+            ))
+        else:
+            data = distinguished_name
+
+        if data == '':
+            return cls(name='', value=RDNSequence([]))
+
+        attribute_sets = [[]]
+        pos = 0
+
+        while pos < len(data):
+            oid, pos = _rfc4514_attribute_type(data, pos)
+            pos = _rfc4514_skip_spaces(data, pos)
+            if pos >= len(data) or data[pos] != '=':
+                _rfc4514_error(data, pos, 'missing equals sign')
+            pos += 1
+            if pos >= len(data):
+                _rfc4514_error(data, pos, 'missing attribute value')
+
+            attribute_name = NameType.map(oid)
+            value_start = pos
+            if data[pos] == '#':
+                value, pos = _rfc4514_parse_hex_value(data, pos + 1)
+            else:
+                if data[pos] == ' ':
+                    _rfc4514_error(data, pos, 'leading spaces must be escaped')
+                value, pos = _rfc4514_parse_string_value(data, pos)
+
+            attribute_sets[-1].append(
+                _rfc4514_build_value(
+                    attribute_name,
+                    value,
+                    data,
+                    value_start,
+                    use_hex=data[value_start] == '#'
+                )
+            )
+
+            pos = _rfc4514_skip_spaces(data, pos)
+            if pos >= len(data):
+                break
+
+            while pos < len(data) and data[pos] == '+':
+                pos += 1
+                pos = _rfc4514_skip_spaces(data, pos)
+                if pos >= len(data):
+                    _rfc4514_error(data, pos, 'missing multi-valued RDN attribute')
+
+                oid, pos = _rfc4514_attribute_type(data, pos)
+                pos = _rfc4514_skip_spaces(data, pos)
+                if pos >= len(data) or data[pos] != '=':
+                    _rfc4514_error(data, pos, 'missing equals sign')
+                pos += 1
+                if pos >= len(data):
+                    _rfc4514_error(data, pos, 'missing attribute value')
+
+                attribute_name = NameType.map(oid)
+                value_start = pos
+                if data[pos] == '#':
+                    value, pos = _rfc4514_parse_hex_value(data, pos + 1)
+                else:
+                    if data[pos] == ' ':
+                        _rfc4514_error(data, pos, 'leading spaces must be escaped')
+                    value, pos = _rfc4514_parse_string_value(data, pos)
+
+                attribute_sets[-1].append(
+                    _rfc4514_build_value(
+                        attribute_name,
+                        value,
+                        data,
+                        value_start,
+                        use_hex=data[value_start] == '#'
+                    )
+                )
+                pos = _rfc4514_skip_spaces(data, pos)
+
+            if pos >= len(data):
+                break
+
+            if data[pos] != ',':
+                _rfc4514_error(data, pos, 'expected an RDN separator')
+            pos += 1
+            pos = _rfc4514_skip_spaces(data, pos)
+            if pos >= len(data):
+                _rfc4514_error(data, pos, 'missing RDN')
+            attribute_sets.append([])
+
+        return cls(name='', value=RDNSequence([
+            RelativeDistinguishedName(attributes)
+            for attributes in attribute_sets
+        ]))
+
+    @classmethod
+    def from_rfc4514_string(cls, distinguished_name):
+        return cls.build_rfc4514(distinguished_name)
+
+    @classmethod
+    def parse_rfc4514(cls, distinguished_name):
+        return cls.build_rfc4514(distinguished_name)
+
+    def _dump_rfc4514(self):
+        rdns = []
+        for rdn in self.chosen:
+            attributes = []
+            for type_value in rdn:
+                value = type_value['value']
+                native_value = getattr(value, 'native', None)
+                if type_value._rfc4514_hex:
+                    rendered_value = '#' + binascii.hexlify(value.dump(force=True)).decode('ascii')
+                else:
+                    attribute_name = type_value['type'].native
+                    if attribute_name not in NameTypeAndValue._oid_specs:
+                        rendered_value = '#' + binascii.hexlify(value.dump(force=True)).decode('ascii')
+                    elif isinstance(native_value, str_cls):
+                        try:
+                            native_value.encode('utf-8')
+                        except UnicodeEncodeError:
+                            rendered_value = '#' + binascii.hexlify(value.dump(force=True)).decode('ascii')
+                        else:
+                            rendered_value = _rfc4514_escape_value(native_value)
+                    else:
+                        rendered_value = '#' + binascii.hexlify(value.dump(force=True)).decode('ascii')
+                attribute_type = _RFC4514_ATTRIBUTE_KEYWORDS.get(
+                    type_value['type'].native,
+                    type_value['type'].dotted
+                )
+                attributes.append('%s=%s' % (
+                    attribute_type,
+                    rendered_value
+                ))
+            rdns.append('+'.join(attributes))
+        return ','.join(rdns)
+
+    @property
+    def rfc4514_string(self):
+        return self._dump_rfc4514()
+
+    def dump_rfc4514(self):
+        return self._dump_rfc4514()
+
+    def to_rfc4514_string(self):
+        return self._dump_rfc4514()
 
     @property
     def hashable(self):
