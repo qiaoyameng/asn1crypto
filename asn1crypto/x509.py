@@ -16,6 +16,7 @@ Other type classes are defined that help compose the types listed above.
 from __future__ import unicode_literals, division, absolute_import, print_function
 
 from contextlib import contextmanager
+import binascii
 from encodings import idna  # noqa
 import hashlib
 import re
@@ -58,9 +59,39 @@ from .core import (
     UTF8String,
     VisibleString,
     VOID,
+    _parse_build,
 )
 from .keys import PublicKeyInfo
 from .util import int_to_bytes, int_from_bytes, inet_ntop, inet_pton
+
+
+class RFC4514Error(ValueError):
+    """
+    An error parsing a distinguished name string as defined in RFC 4514. The
+    ``position`` attribute contains the zero-based index into the original
+    string where the error was detected.
+    """
+
+    def __init__(self, message, position):
+        self.position = position
+        super(RFC4514Error, self).__init__('%s (position %d)' % (message, position))
+
+
+# RFC 4519 short attribute types that RFC 4514 requires user interfaces to
+# recognize. Attribute types are always emitted as dotted OIDs when
+# serializing so the canonical form never depends on this table.
+_RFC4514_KEYWORDS = {
+    'CN': '2.5.4.3',
+    'C': '2.5.4.6',
+    'L': '2.5.4.7',
+    'ST': '2.5.4.8',
+    'O': '2.5.4.10',
+    'OU': '2.5.4.11',
+    'STREET': '2.5.4.9',
+    'SERIALNUMBER': '2.5.4.5',
+    'DC': '0.9.2342.19200300.100.1.25',
+    'UID': '0.9.2342.19200300.100.1.1',
+}
 
 
 # The structures in this file are taken from https://tools.ietf.org/html/rfc5280
@@ -975,6 +1006,306 @@ class RDNSequence(SequenceOf):
         return True
 
 
+def _rfc4514_encode_value(attribute_name, attribute_value):
+    """
+    Encodes a native unicode string value for a known attribute type using the
+    same encoding rules as Name.build()
+
+    :param attribute_name:
+        A unicode string of the mapped attribute name
+
+    :param attribute_value:
+        A unicode string
+
+    :return:
+        An Asn1Value object
+    """
+
+    attribute_class = NameTypeAndValue._oid_specs[attribute_name]
+
+    if attribute_class is not DirectoryString:
+        return attribute_class(attribute_value)
+
+    if attribute_name in set(['dn_qualifier', 'country_name', 'serial_number']):
+        return DirectoryString(
+            name='printable_string',
+            value=PrintableString(attribute_value)
+        )
+
+    return DirectoryString(
+        name='utf8_string',
+        value=UTF8String(attribute_value)
+    )
+
+
+def _rfc4514_escape_string(string):
+    """
+    Escapes a unicode attribute value for inclusion in an RFC 4514 string.
+    Escaping "+", ",", "=" and other RFC 4514 special characters (including
+    leading/trailing spaces) ensures the RDN grouping is preserved when the
+    output is parsed again. Non-ASCII characters are emitted as-is as UTF-8;
+    control characters and non-printable bytes are rendered as \\XX.
+
+    :param string:
+        A unicode string
+
+    :return:
+        A unicode string safe for RFC 4514 serialization
+    """
+
+    output = []
+    for index, char in enumerate(string):
+        code = ord(char)
+        if code < 0x20 or code == 0x7f:
+            output.append('\\%02X' % code)
+        elif char == '\\' or char in ' ,+"=;<>#':
+            # Spaces are escaped with \20 at the start/end of the value, and
+            # with a backslash elsewhere, matching RFC 4514 examples.
+            if char == ' ' and (index == 0 or index == len(string) - 1):
+                output.append('\\20')
+            else:
+                output.append('\\' + char)
+        else:
+            output.append(char)
+
+    return ''.join(output)
+
+
+def _parse_rfc4514(string):
+    """
+    Parses a distinguished name string as described in RFC 4514 into a list of
+    relative distinguished names, each of which is a list of
+    (oid_dotted, mode, payload, value_position) tuples. ``mode`` is "string"
+    for a regular string value (only allowed for known attribute types) and
+    "hex" for the #<hexpair> form containing a complete DER-encoded attribute
+    value. ``value_position`` is the index of the value in the original string.
+
+    :param string:
+        A unicode string in RFC 4514 format
+
+    :raises:
+        RFC4514Error - when the string can not be parsed
+
+    :return:
+        A list of lists of 4-element tuples
+    """
+
+    if not isinstance(string, str_cls):
+        raise TypeError(unwrap(
+            '''
+            string must be a unicode string, not %s
+            ''',
+            type_name(string)
+        ))
+
+    length = len(string)
+    index = 0
+    rdns = []
+
+    def error(message, position):
+        raise RFC4514Error(unwrap(message), position)
+
+    def skip_spaces(position):
+        # As per RFC 4514 section 3, spaces surrounding separators and the
+        # equals sign are insignificant.
+        while position < length and string[position] == ' ':
+            position += 1
+        return position
+
+    while index < length:
+        rdn = []
+        rdn_types = set()
+
+        while True:
+            type_start = index
+            while index < length and string[index] not in '=,+ ':
+                index += 1
+
+            type_string = string[type_start:index]
+            if not type_string:
+                error(
+                    'Expected an attribute type, but found %r'
+                    % (string[index] if index < length else ''),
+                    type_start
+                )
+
+            index = skip_spaces(index)
+            if index >= length or string[index] != '=':
+                error('Expected "=" after the attribute type %s' % type_string, index)
+            index += 1
+            index = skip_spaces(index)
+
+            if type_string[0].isdigit():
+                if not re.match(r'^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*$', type_string):
+                    error('Invalid dotted object identifier %s' % type_string, type_start)
+                oid = type_string
+            else:
+                oid = _RFC4514_KEYWORDS.get(type_string.upper())
+                if oid is None:
+                    error('Unknown attribute type keyword %s' % type_string, type_start)
+
+            try:
+                ObjectIdentifier(oid)
+            except (ValueError, TypeError):
+                error('Invalid object identifier %s' % oid, type_start)
+
+            if oid in rdn_types:
+                error(
+                    'Duplicate attribute type %s in a relative distinguished name' % oid,
+                    type_start
+                )
+            rdn_types.add(oid)
+
+            value_start = index
+            if index < length and string[index] == '#':
+                index += 1
+                hex_start = index
+                while index < length and string[index] in '0123456789abcdefABCDEF':
+                    index += 1
+                hex_end = index
+                while index < length and string[index] == ' ':
+                    index += 1
+                hex_string = string[hex_start:hex_end]
+                if not hex_string or len(hex_string) % 2:
+                    error('Invalid hex-encoded attribute value for %s' % oid, value_start)
+                rdn.append((oid, 'hex', hex_string, value_start))
+
+            else:
+                # Unescaped leading spaces are insignificant per RFC 4514.
+                while index < length and string[index] == ' ':
+                    index += 1
+
+                chunks = []
+                while index < length:
+                    char = string[index]
+                    if char == '\\':
+                        index += 1
+                        if index >= length:
+                            error('Incomplete escape sequence', index)
+                        if index + 1 < length and \
+                                string[index] in '0123456789abcdefABCDEF' and \
+                                string[index + 1] in '0123456789abcdefABCDEF':
+                            chunks.append(('byte', byte_cls([int(string[index:index + 2], 16)])))
+                            index += 2
+                            continue
+                        escaped_char = string[index]
+                        if escaped_char in ' ,+"<>;\\=#':
+                            chunks.append(('char', escaped_char))
+                            index += 1
+                            continue
+                        error('Invalid escaped character %r' % escaped_char, index)
+
+                    if char in ',+':
+                        break
+
+                    if char == '\x00':
+                        error('Null characters must be escaped as \\00', index)
+
+                    chunks.append(('char', char))
+                    index += 1
+
+                # Unescaped trailing spaces are insignificant per RFC 4514.
+                while chunks and chunks[-1] == ('char', ' '):
+                    chunks.pop()
+
+                attribute_name = NameType.map(oid)
+                if attribute_name not in NameTypeAndValue._oid_specs:
+                    error(
+                        'String value for unknown attribute type %s can not be '
+                        'assigned an ASN.1 type - use the #<hex> form with a '
+                        'complete DER-encoded value instead' % oid,
+                        value_start
+                    )
+
+                # Raw chars are encoded as UTF-8 so \XX byte escapes may occur
+                # in the middle of a multi-byte sequence.
+                raw = b''
+                try:
+                    for kind, piece in chunks:
+                        if kind == 'byte':
+                            raw += piece
+                        else:
+                            raw += piece.encode('utf-8')
+                    value = raw.decode('utf-8')
+                except UnicodeError:
+                    error('Attribute value for %s is not valid UTF-8' % oid, value_start)
+
+                rdn.append((oid, 'string', value, value_start))
+
+            if index >= length:
+                break
+
+            separator = string[index]
+            if separator == '+':
+                index += 1
+                index = skip_spaces(index)
+                continue
+            if separator == ',':
+                break
+            error('Unexpected character %r in attribute value' % separator, index)
+
+        rdns.append(rdn)
+
+        if index >= length:
+            break
+
+        # string[index] == ','
+        index += 1
+        if index >= length:
+            error('Expected an attribute type after ","', index)
+        index = skip_spaces(index)
+        if index >= length:
+            error('Expected an attribute type after ","', index)
+
+    return rdns
+
+
+def _build_rfc4514_name(string):
+    """
+    Parses an RFC 4514 distinguished name string into a Name object
+
+    :param string:
+        A unicode string in RFC 4514 format
+
+    :raises:
+        RFC4514Error - when the string can not be parsed
+
+    :return:
+        An x509.Name object
+    """
+
+    rdns = []
+    for rdn_parts in _parse_rfc4514(string):
+        ntvs = []
+        for oid, mode, payload, value_position in rdn_parts:
+            attribute_name = NameType.map(oid)
+            try:
+                if mode == 'string':
+                    value = _rfc4514_encode_value(attribute_name, payload)
+                else:
+                    der_bytes = binascii.unhexlify(payload)
+                    spec = NameTypeAndValue._oid_specs.get(attribute_name)
+                    if spec is None:
+                        parsed, _ = _parse_build(der_bytes, strict=True)
+                        value = Any(value=parsed)
+                    else:
+                        value, _ = _parse_build(der_bytes, spec=spec, strict=True)
+                ntvs.append(NameTypeAndValue({'type': oid, 'value': value}))
+            except (ValueError, TypeError) as e:
+                message = e.args[0] if e.args else 'unable to decode value'
+                raise RFC4514Error(
+                    'Invalid attribute value for %s - %s' % (oid, message),
+                    value_position
+                )
+        rdns.append(RelativeDistinguishedName(ntvs))
+
+    # RFC 4514 lists RDNs starting with the most specific (the last element
+    # of the DER RDNSequence), so the order is reversed when constructing the
+    # ASN.1 structure.
+    rdns.reverse()
+    return Name(name='', value=RDNSequence(rdns))
+
+
 class Name(Choice):
     _alternatives = [
         ('', RDNSequence),
@@ -1056,6 +1387,74 @@ class Name(Choice):
             ]))
 
         return cls(name='', value=RDNSequence(rdns))
+
+    @classmethod
+    def from_rfc4514_string(cls, string):
+        """
+        Parses a distinguished name string formatted according to RFC 4514,
+        e.g. "CN=Will Bond,O=Codex Non Sufficit LC,C=US".
+
+        Multi-valued RDNs (joined with "+"), backslash escapes, UTF-8 hex
+        escapes (\\XX) and "#"-prefixed DER-encoded values are all supported.
+        The same OID may occur in multiple RDNs. String values are only
+        accepted for attribute types with a known value specification; values
+        for unknown OIDs must be supplied as "#" hex of the complete DER
+        encoding, so no string type is guessed.
+
+        :param string:
+            A unicode string in RFC 4514 format
+
+        :raises:
+            RFC4514Error - when the string can not be parsed, with the
+            ``position`` attribute indicating where in the original string
+            the error occurred
+
+        :return:
+            An x509.Name object
+        """
+
+        return _build_rfc4514_name(string)
+
+    def rfc4514_string(self):
+        """
+        Formats the distinguished name as a unicode string per RFC 4514.
+
+        The output is a canonical representation that can be parsed again with
+        from_rfc4514_string(): attribute types are dotted OIDs, values for
+        unknown attribute types (or values that are not character strings) are
+        rendered as "#" followed by the hex of their complete DER encoding,
+        and leading/trailing spaces, "+", ",", "=" and other special
+        characters are escaped so that RDN grouping is preserved. This is
+        intentionally different from human_friendly, which is for display
+        only.
+
+        :return:
+            A unicode string in RFC 4514 format
+        """
+
+        rdns = []
+        for rdn in self.chosen:
+            parts = []
+            for ntv in rdn:
+                oid = ntv['type'].dotted
+                attribute_name = ntv['type'].native
+                value_obj = ntv['value']
+
+                native_value = value_obj.native
+                is_string = isinstance(native_value, str_cls)
+                if attribute_name not in NameTypeAndValue._oid_specs or not is_string:
+                    # Unknown OIDs and non-string values are kept verbatim as
+                    # DER so the encoding round-trips without guessing a type.
+                    rendered = '#' + value_obj.dump().hex().upper()
+                else:
+                    rendered = _rfc4514_escape_string(native_value)
+
+                parts.append('%s=%s' % (oid, rendered))
+            rdns.append('+'.join(parts))
+
+        # The DER RDNSequence runs from least specific to most specific,
+        # while RFC 4514 lists them in the opposite order.
+        return ','.join(reversed(rdns))
 
     @property
     def hashable(self):

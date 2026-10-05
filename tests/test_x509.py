@@ -502,6 +502,196 @@ class X509Tests(unittest.TestCase):
             complex_name.hashable
         )
 
+    def test_rfc4514_basic(self):
+        parsed = x509.Name.from_rfc4514_string('CN=Will Bond,O=Codex Non Sufficit LC,C=US')
+        built = x509.Name.build({
+            'common_name': 'Will Bond',
+            'organization_name': 'Codex Non Sufficit LC',
+            'country_name': 'US',
+        })
+        self.assertEqual(built, parsed)
+        self.assertEqual(
+            '2.5.4.3=Will\\ Bond,2.5.4.10=Codex\\ Non\\ Sufficit\\ LC,2.5.4.6=US',
+            parsed.rfc4514_string()
+        )
+        self.assertEqual(parsed, x509.Name.from_rfc4514_string(parsed.rfc4514_string()))
+
+    def test_rfc4514_keywords_and_dotted_oids(self):
+        lower = x509.Name.from_rfc4514_string('cn=Will,c=US')
+        dotted = x509.Name.from_rfc4514_string('2.5.4.3=Will,2.5.4.6=US')
+        self.assertEqual(lower, dotted)
+        # Canonical output always uses dotted OIDs, not keywords.
+        self.assertEqual('2.5.4.3=Will,2.5.4.6=US', lower.rfc4514_string())
+
+    def test_rfc4514_multi_valued_rdn_is_not_merged(self):
+        # These two names print similarly but group attributes into RDNs
+        # differently - the multi-valued RDN must survive parse/format.
+        multi = x509.Name.from_rfc4514_string('CN=John Doe+OU=Sales,O=Example Corp,C=US')
+        separate = x509.Name.from_rfc4514_string('CN=John Doe,OU=Sales,O=Example Corp,C=US')
+
+        # In the DER RDNSequence the string order is reversed; the
+        # multi-valued RDN is therefore the final element.
+        self.assertEqual([1, 1, 2], [len(rdn) for rdn in multi.chosen])
+        self.assertEqual([1, 1, 1, 1], [len(rdn) for rdn in separate.chosen])
+        self.assertNotEqual(multi, separate)
+
+        self.assertEqual(
+            '2.5.4.3=John\\ Doe+2.5.4.11=Sales,2.5.4.10=Example\\ Corp,2.5.4.6=US',
+            multi.rfc4514_string()
+        )
+        self.assertEqual(
+            '2.5.4.3=John\\ Doe,2.5.4.11=Sales,2.5.4.10=Example\\ Corp,2.5.4.6=US',
+            separate.rfc4514_string()
+        )
+        self.assertEqual(multi, x509.Name.from_rfc4514_string(multi.rfc4514_string()))
+        self.assertEqual(separate, x509.Name.from_rfc4514_string(separate.rfc4514_string()))
+
+    def test_rfc4514_same_oid_in_different_rdns(self):
+        name = x509.Name.from_rfc4514_string('CN=leaf,OU=Inner,OU=Outer,C=US')
+        self.assertEqual(['US', 'Outer', 'Inner', 'leaf'], [
+            rdn[0]['value'].native for rdn in name.chosen
+        ])
+        self.assertEqual(
+            '2.5.4.3=leaf,2.5.4.11=Inner,2.5.4.11=Outer,2.5.4.6=US',
+            name.rfc4514_string()
+        )
+        self.assertEqual(name, x509.Name.from_rfc4514_string(name.rfc4514_string()))
+
+    def test_rfc4514_escapes(self):
+        name = x509.Name.from_rfc4514_string(r'CN=a\+b\,\ c\=d\;e\\"f\>g')
+        self.assertEqual('a+b, c=d;e\\"f>g', name.chosen[0][0]['value'].native)
+
+        # A literal leading "#" must be escaped or it denotes DER hex.
+        hash_name = x509.Name.from_rfc4514_string('CN=\\#123')
+        self.assertEqual('#123', hash_name.chosen[0][0]['value'].native)
+        self.assertEqual('2.5.4.3=\\#123', hash_name.rfc4514_string())
+
+        # Leading/trailing spaces and a literal plus must not alter grouping
+        # when the value is formatted back out.
+        spaced = x509.Name.from_rfc4514_string('CN=\\20 a\\+b \\20')
+        self.assertEqual('  a+b  ', spaced.chosen[0][0]['value'].native)
+        self.assertEqual(1, len(spaced.chosen[0]))
+        rendered = spaced.rfc4514_string()
+        self.assertEqual('2.5.4.3=\\20\\ a\\+b\\ \\20', rendered)
+        self.assertEqual(spaced, x509.Name.from_rfc4514_string(rendered))
+
+    def test_rfc4514_utf8_hex_escape_roundtrip(self):
+        name = x509.Name.from_rfc4514_string('CN=\\e6\\b5\\8b\\e8\\af\\95,O=Acme,C=CN')
+        self.assertEqual('测试', name.chosen[-1][0]['value'].native)
+        rendered = name.rfc4514_string()
+        self.assertEqual('2.5.4.3=测试,2.5.4.10=Acme,2.5.4.6=CN', rendered)
+        self.assertEqual(name, x509.Name.from_rfc4514_string(rendered))
+
+        # Raw UTF-8 characters in the input are supported too, and may be mixed
+        # with byte escapes.
+        mixed = x509.Name.from_rfc4514_string('CN=a\\e6\\b5\\8bb')
+        self.assertEqual('a测b', mixed.chosen[-1][0]['value'].native)
+
+    def test_rfc4514_empty_value_roundtrip(self):
+        name = x509.Name.from_rfc4514_string('CN=,O=Acme')
+        self.assertEqual('', name.chosen[-1][0]['value'].native)
+        rendered = name.rfc4514_string()
+        self.assertEqual('2.5.4.3=,2.5.4.10=Acme', rendered)
+        self.assertEqual(name, x509.Name.from_rfc4514_string(rendered))
+
+    def test_rfc4514_unknown_oid_requires_der(self):
+        with self.assertRaises(x509.RFC4514Error) as cm:
+            x509.Name.from_rfc4514_string('CN=x,1.2.3.4.5=hello')
+        self.assertEqual(15, cm.exception.position)
+
+        der_hex = core.UTF8String('hello').dump().hex().upper()
+        name = x509.Name.from_rfc4514_string('CN=x,1.2.3.4.5=#%s' % der_hex)
+        self.assertEqual('1.2.3.4.5', name.chosen[0][0]['type'].dotted)
+        self.assertIsInstance(name.chosen[0][0]['value'], core.Any)
+        # Unknown OIDs are emitted verbatim as DER hex, never re-typed.
+        rendered = name.rfc4514_string()
+        self.assertEqual('2.5.4.3=x,1.2.3.4.5=#%s' % der_hex, rendered)
+        self.assertEqual(name.dump(), x509.Name.from_rfc4514_string(rendered).dump())
+
+        # Non-character DER for an unknown OID must also round-trip byte
+        # for byte (no guessing that it is a string).
+        octet_hex = core.OctetString(b'\xff\xfe\x00').dump().hex().upper()
+        octet_name = x509.Name.from_rfc4514_string('1.2.3.4.5=#%s' % octet_hex)
+        self.assertEqual('#' + octet_hex, octet_name.rfc4514_string().split('=', 1)[1])
+        self.assertEqual(
+            octet_name.dump(),
+            x509.Name.from_rfc4514_string(octet_name.rfc4514_string()).dump()
+        )
+
+    def test_rfc4514_der_hex_known_oid(self):
+        name = x509.Name.from_rfc4514_string('C=#13025553')
+        self.assertEqual('US', name.chosen[0][0]['value'].native)
+        self.assertEqual(x509.Name.build({'country_name': 'US'}), name)
+
+        with self.assertRaises(x509.RFC4514Error) as cm:
+            x509.Name.from_rfc4514_string('CN=#0C05AB')
+        self.assertEqual(3, cm.exception.position)
+
+    def test_rfc4514_non_string_known_value_roundtrip(self):
+        # unique_identifier is an OCTET BIT STRING, not a character string,
+        # so it is serialized as DER hex.
+        name = x509.Name.build({'unique_identifier': b'\x00\x01'})
+        rendered = name.rfc4514_string()
+        self.assertEqual('2.5.4.45=#0303000001', rendered)
+        self.assertEqual(name.dump(), x509.Name.from_rfc4514_string(rendered).dump())
+
+    def test_rfc4514_error_positions(self):
+        cases = [
+            ('CN', 2),
+            ('CN=x,', 5),
+            ('CN=x,,O=y', 5),
+            ('FOO=bar', 0),
+            ('CN=\\', 4),
+            ('CN=\\q', 4),
+            ('CN=#zz', 3),
+            ('2.5.4=x', 6),
+            ('CN=a+CN=b', 5),
+        ]
+        for string, position in cases:
+            with self.assertRaises(x509.RFC4514Error) as cm:
+                x509.Name.from_rfc4514_string(string)
+            self.assertEqual(position, cm.exception.position, string)
+            self.assertIn('position %d' % position, str(cm.exception))
+
+    def test_rfc4514_empty_string(self):
+        name = x509.Name.from_rfc4514_string('')
+        self.assertEqual(0, len(name.chosen))
+        self.assertEqual('', name.rfc4514_string())
+
+    def test_rfc4514_is_not_human_friendly(self):
+        name = x509.Name.build({
+            'country_name': 'US',
+            'organization_name': 'Acme',
+            'common_name': 'Will Bond',
+        })
+        self.assertNotEqual(name.human_friendly, name.rfc4514_string())
+        self.assertEqual(
+            '2.5.4.3=Will\\ Bond,2.5.4.10=Acme,2.5.4.6=US',
+            name.rfc4514_string()
+        )
+
+    def test_rfc4514_cert_roundtrip(self):
+        cert = self._load_cert('geotrust_certs/codex.crt')
+        for field in ('subject', 'issuer'):
+            name = cert['tbs_certificate'][field]
+            rendered = name.rfc4514_string()
+            parsed = x509.Name.from_rfc4514_string(rendered)
+            # Structural equality follows RFC 5280 name comparison.
+            self.assertEqual(name, parsed)
+
+        # The original cert uses TeletexString for DirectoryString values,
+        # which the plain string form does not preserve; the "#DER" form
+        # however recovers the exact bytes.
+        subject = cert['tbs_certificate']['subject']
+        rdn_strings = []
+        for rdn in subject.chosen:
+            rdn_strings.append('+'.join(
+                '%s=#%s' % (ntv['type'].dotted, ntv['value'].dump().hex().upper())
+                for ntv in rdn
+            ))
+        der_form = ','.join(reversed(rdn_strings))
+        self.assertEqual(subject.dump(), x509.Name.from_rfc4514_string(der_form).dump())
+
     def test_v1_cert(self):
         cert = self._load_cert('chromium/ndn.ca.crt')
         tbs_cert = cert['tbs_certificate']
