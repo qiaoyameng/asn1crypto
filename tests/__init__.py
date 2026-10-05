@@ -165,6 +165,7 @@ def test_classes():
     from .test_algos import AlgoTests
     from .test_cms import CMSTests
     from .test_crl import CRLTests
+    from .test_crl_check import CRLCheckTests
     from .test_csr import CSRTests
     from .test_init import InitTests
     from .test_keys import KeysTests
@@ -181,6 +182,7 @@ def test_classes():
         AlgoTests,
         CMSTests,
         CRLTests,
+        CRLCheckTests,
         CSRTests,
         InitTests,
         KeysTests,
