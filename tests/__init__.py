@@ -168,6 +168,7 @@ def test_classes():
     from .test_csr import CSRTests
     from .test_init import InitTests
     from .test_keys import KeysTests
+    from .test_name_constraints import NameConstraintsTests
     from .test_ocsp import OCSPTests
     from .test_pem import PEMTests
     from .test_pkcs12 import PKCS12Tests
@@ -184,6 +185,7 @@ def test_classes():
         CSRTests,
         InitTests,
         KeysTests,
+        NameConstraintsTests,
         OCSPTests,
         PEMTests,
         PKCS12Tests,
