@@ -1039,3 +1039,477 @@ class CMSTests(unittest.TestCase):
             'recipient_key_id',
             old_sekp.name,
         )
+
+
+class _DerBuilder(object):
+    """
+    Tiny DER builder used to construct independent, short CMS vectors without
+    relying on asn1crypto's own encoder for the bytes under test.
+    """
+
+    SIGNED_DATA = '1.2.840.113549.1.7.2'
+    DATA = '1.2.840.113549.1.7.1'
+    CONTENT_TYPE_ATTR = '1.2.840.113549.1.9.3'
+    MESSAGE_DIGEST_ATTR = '1.2.840.113549.1.9.4'
+    SHA256 = '2.16.840.1.101.3.4.2.1'
+    SHA256_RSA = '1.2.840.113549.1.1.11'
+    SHA512_RSA = '1.2.840.113549.1.1.13'
+    PKCS1 = '1.2.840.113549.1.1.1'
+    ED25519 = '1.3.101.112'
+    SKI = b'\x11\x22\x33\x44'
+    SIGNATURE = b'\x7f' * 16
+
+    @staticmethod
+    def _byte(value):
+        if sys.version_info < (3,):
+            return byte_cls([value])
+        return byte_cls([value])
+
+    @classmethod
+    def _bytes(cls, values):
+        return b''.join(cls._byte(value) for value in values)
+
+    @staticmethod
+    def _length(length):
+        if length < 0x80:
+            return _DerBuilder._byte(length)
+        parts = []
+        while length:
+            parts.insert(0, length & 0xFF)
+            length >>= 8
+        return _DerBuilder._byte(0x80 | len(parts)) + _DerBuilder._bytes(parts)
+
+    @classmethod
+    def tlv(cls, tag, value):
+        return cls._byte(tag) + cls._length(len(value)) + value
+
+    @classmethod
+    def oid(cls, oid_string):
+        arcs = [int(part) for part in oid_string.split('.')]
+        content = [40 * arcs[0] + arcs[1]]
+        for arc in arcs[2:]:
+            if arc == 0:
+                content.append(0)
+                continue
+            pieces = [arc & 0x7F]
+            arc >>= 7
+            while arc:
+                pieces.append(0x80 | (arc & 0x7F))
+                arc >>= 7
+            content.extend(reversed(pieces))
+        return cls.tlv(0x06, cls._bytes(content))
+
+    @classmethod
+    def sequence(cls, *items):
+        return cls.tlv(0x30, b''.join(items))
+
+    @classmethod
+    def set_of(cls, *items):
+        return cls.tlv(0x31, b''.join(items))
+
+    @classmethod
+    def integer(cls, value):
+        parts = []
+        while value:
+            parts.insert(0, value & 0xFF)
+            value >>= 8
+        if not parts:
+            parts = [0]
+        if parts[0] & 0x80:
+            parts.insert(0, 0)
+        return cls.tlv(0x02, cls._bytes(parts))
+
+    @classmethod
+    def octet_string(cls, value):
+        return cls.tlv(0x04, value)
+
+    @classmethod
+    def algorithm(cls, oid_string):
+        return cls.sequence(cls.oid(oid_string))
+
+    @classmethod
+    def rsassa_pss_algorithm(cls, hash_oid):
+        digest_algorithm = cls.sequence(cls.oid(hash_oid), b'\x05\x00')
+        mask_gen = cls.sequence(cls.oid('1.2.840.113549.1.1.8'), digest_algorithm)
+        parameters = cls.sequence(
+            cls.tlv(0xA0, digest_algorithm),
+            cls.tlv(0xA1, mask_gen),
+            cls.tlv(0xA2, cls.integer(64)),
+        )
+        return cls.sequence(cls.oid('1.2.840.113549.1.1.10'), parameters)
+
+    @classmethod
+    def signer_info_with_algorithm(cls, digest_oid, signature_algorithm,
+                                   signed_attrs_der=None, signature=None):
+        if signature is None:
+            signature = cls.SIGNATURE
+        fields = [
+            cls.integer(3),
+            cls._implicit(0, cls.octet_string(cls.SKI)),
+            cls.algorithm(digest_oid),
+        ]
+        if signed_attrs_der is not None:
+            fields.append(cls.signed_attrs_field(signed_attrs_der))
+        fields.extend([
+            signature_algorithm,
+            cls.octet_string(signature),
+        ])
+        return cls.sequence(*fields)
+
+    @classmethod
+    def attribute(cls, oid_string, *values):
+        return cls.sequence(cls.oid(oid_string), cls.set_of(*values))
+
+    @classmethod
+    def _implicit(cls, tag_number, der_value, constructed=False):
+        # Strips the universal TLV header of a complete DER value and retags
+        # its contents as IMPLICIT.
+        index = 1
+        if der_value[index] & 0x80:
+            index += 1 + (der_value[index] & 0x7F)
+        else:
+            index += 1
+        tag = 0xA0 | tag_number if constructed else 0x80 | tag_number
+        return cls.tlv(tag, der_value[index:])
+
+    @classmethod
+    def signed_attrs_field(cls, signed_attrs_der):
+        return cls._implicit(0, signed_attrs_der, constructed=True)
+
+    @classmethod
+    def signer_info(cls, digest_oid, signature_oid, signed_attrs_der=None,
+                    signature=None):
+        if signature is None:
+            signature = cls.SIGNATURE
+        fields = [
+            cls.integer(3),
+            cls._implicit(0, cls.octet_string(cls.SKI)),
+            cls.algorithm(digest_oid),
+        ]
+        if signed_attrs_der is not None:
+            fields.append(cls.signed_attrs_field(signed_attrs_der))
+        fields.extend([
+            cls.algorithm(signature_oid),
+            cls.octet_string(signature),
+        ])
+        return cls.sequence(*fields)
+
+    @classmethod
+    def content_info(cls, signer_infos, content, content_type_oid=None,
+                     include_content=True):
+        if content_type_oid is None:
+            content_type_oid = cls.DATA
+        encap = cls.sequence(cls.oid(content_type_oid))
+        if include_content:
+            encap = cls.sequence(
+                cls.oid(content_type_oid),
+                cls.tlv(0xA0, cls.octet_string(content)),
+            )
+        signed_data = cls.sequence(
+            cls.integer(3),
+            cls.set_of(cls.algorithm(cls.SHA256)),
+            encap,
+            cls.set_of(*signer_infos),
+        )
+        return cls.sequence(
+            cls.oid(cls.SIGNED_DATA),
+            cls.tlv(0xA0, signed_data),
+        )
+
+    @classmethod
+    def valid_attrs(cls, content, content_type_oid=None):
+        import hashlib
+        if content_type_oid is None:
+            content_type_oid = cls.DATA
+        return cls.set_of(
+            cls.attribute(cls.CONTENT_TYPE_ATTR, cls.oid(content_type_oid)),
+            cls.attribute(
+                cls.MESSAGE_DIGEST_ATTR,
+                cls.octet_string(hashlib.sha256(content).digest()),
+            ),
+        )
+
+
+class SignerVerificationMaterialTests(unittest.TestCase):
+    CONTENT = b'hello detached world'
+
+    def _embedded(self, signer_infos=None, content=None, **kwargs):
+        if content is None:
+            content = self.CONTENT
+        if signer_infos is None:
+            signer_infos = [
+                _DerBuilder.signer_info(
+                    _DerBuilder.SHA256,
+                    _DerBuilder.SHA256_RSA,
+                    _DerBuilder.valid_attrs(content),
+                )
+            ]
+        return _DerBuilder.content_info(signer_infos, content, **kwargs)
+
+    def _detached(self, signer_infos=None):
+        if signer_infos is None:
+            signer_infos = [
+                _DerBuilder.signer_info(
+                    _DerBuilder.SHA256,
+                    _DerBuilder.SHA256_RSA,
+                    _DerBuilder.valid_attrs(self.CONTENT),
+                )
+            ]
+        return _DerBuilder.content_info(
+            signer_infos, self.CONTENT, include_content=False
+        )
+
+    def test_embedded_signed_attrs_input_is_der_set(self):
+        attrs_der = _DerBuilder.valid_attrs(self.CONTENT)
+        info = self._embedded()
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        # The signed input is the standalone DER SET OF, never the [0] field
+        self.assertEqual(attrs_der, material.verification_input)
+        self.assertEqual(attrs_der, material.signed_attrs_der)
+        self.assertEqual(b'\x31', material.verification_input[0:1])
+        self.assertNotEqual(b'\xa0', material.verification_input[0:1])
+        self.assertFalse(material.content_is_detached)
+        self.assertTrue(material.has_signed_attrs)
+        self.assertEqual([], material.problems)
+        self.assertTrue(material.content_type_match)
+        self.assertEqual(material.content_digest, material.message_digest)
+
+    def test_detached_content(self):
+        info = self._detached()
+
+        material = cms.extract_signer_verification_material(
+            info, detached_content=self.CONTENT
+        )[0]
+
+        self.assertTrue(material.content_is_detached)
+        self.assertEqual(self.CONTENT, material.encapsulated_content)
+        self.assertEqual(
+            _DerBuilder.valid_attrs(self.CONTENT),
+            material.verification_input,
+        )
+        self.assertEqual([], material.problems)
+
+    def test_detached_content_missing(self):
+        info = self._detached()
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertEqual(['missing_content'], material.problems)
+        self.assertIsNone(material.content_digest)
+
+    def test_no_signed_attrs_uses_content(self):
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256,
+            _DerBuilder.PKCS1,
+            signed_attrs_der=None,
+        )
+        info = self._embedded([signer])
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertFalse(material.has_signed_attrs)
+        self.assertIsNone(material.signed_attrs_der)
+        self.assertEqual(self.CONTENT, material.verification_input)
+        self.assertEqual([], material.problems)
+        self.assertIsNotNone(material.content_digest)
+
+    def test_modified_embedded_content_reported(self):
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256,
+            _DerBuilder.SHA256_RSA,
+            _DerBuilder.valid_attrs(self.CONTENT),
+        )
+        info = self._embedded(
+            [signer], content=self.CONTENT + b'!'
+        )
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertEqual(['message_digest_mismatch'], material.problems)
+
+    def test_byte_level_content_tamper_reported(self):
+        # Replace one content octet in the otherwise valid encoding (keeping
+        # the length intact), proving the discrepancy is visible before the
+        # verifier is invoked.
+        info = self._embedded()
+        content_offset = info.index(self.CONTENT)
+        tampered = (
+            info[:content_offset] + b'J' + info[content_offset + 1:]
+        )
+
+        material = cms.extract_signer_verification_material(tampered)[0]
+
+        self.assertEqual(['message_digest_mismatch'], material.problems)
+
+    def test_switched_detached_content_reported(self):
+        info = self._detached()
+
+        material = cms.extract_signer_verification_material(
+            info, detached_content=b'totally different content!!!'
+        )[0]
+
+        self.assertEqual(['message_digest_mismatch'], material.problems)
+
+    def test_duplicate_signed_attribute_reported(self):
+        import hashlib
+        digest = hashlib.sha256(self.CONTENT).digest()
+        attrs_der = _DerBuilder.set_of(
+            _DerBuilder.attribute(_DerBuilder.CONTENT_TYPE_ATTR, _DerBuilder.oid(_DerBuilder.DATA)),
+            _DerBuilder.attribute(_DerBuilder.MESSAGE_DIGEST_ATTR, _DerBuilder.octet_string(digest)),
+            _DerBuilder.attribute(_DerBuilder.MESSAGE_DIGEST_ATTR, _DerBuilder.octet_string(digest)),
+        )
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256, _DerBuilder.SHA256_RSA, attrs_der
+        )
+        info = self._embedded([signer])
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertEqual(['duplicate_signed_attribute'], material.problems)
+
+    def test_missing_required_attributes_reported(self):
+        import hashlib
+        attrs_der = _DerBuilder.set_of(
+            _DerBuilder.attribute(
+                _DerBuilder.MESSAGE_DIGEST_ATTR,
+                _DerBuilder.octet_string(hashlib.sha256(self.CONTENT).digest()),
+            ),
+        )
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256, _DerBuilder.SHA256_RSA, attrs_der
+        )
+
+        material = cms.extract_signer_verification_material(
+            self._embedded([signer])
+        )[0]
+
+        self.assertEqual(['missing_signed_attribute'], material.problems)
+
+    def test_content_type_attribute_mismatch_reported(self):
+        attrs_der = _DerBuilder.set_of(
+            _DerBuilder.attribute(
+                _DerBuilder.CONTENT_TYPE_ATTR,
+                _DerBuilder.oid(_DerBuilder.SIGNED_DATA),
+            ),
+            _DerBuilder.attribute(
+                _DerBuilder.MESSAGE_DIGEST_ATTR,
+                _DerBuilder.octet_string(
+                    __import__('hashlib').sha256(self.CONTENT).digest()
+                ),
+            ),
+        )
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256, _DerBuilder.SHA256_RSA, attrs_der
+        )
+
+        material = cms.extract_signer_verification_material(
+            self._embedded([signer])
+        )[0]
+
+        self.assertFalse(material.content_type_match)
+        self.assertEqual(['content_type_mismatch'], material.problems)
+
+    def test_incompatible_signature_digest_algorithms(self):
+        cases = [
+            _DerBuilder.SHA512_RSA,
+            _DerBuilder.ED25519,
+        ]
+        for signature_oid in cases:
+            signer = _DerBuilder.signer_info(
+                _DerBuilder.SHA256,
+                signature_oid,
+                _DerBuilder.valid_attrs(self.CONTENT),
+            )
+
+            material = cms.extract_signer_verification_material(
+                self._embedded([signer])
+            )[0]
+
+            self.assertEqual(
+                ['incompatible_algorithms'],
+                material.problems,
+                msg=signature_oid,
+            )
+
+    def test_generic_rsa_algorithm_compatible_with_any_digest(self):
+        signer = _DerBuilder.signer_info(
+            _DerBuilder.SHA256,
+            _DerBuilder.PKCS1,
+            signed_attrs_der=None,
+        )
+
+        material = cms.extract_signer_verification_material(
+            self._embedded([signer])
+        )[0]
+
+        self.assertEqual([], material.problems)
+
+    def test_rsassa_pss_hash_mismatch_reported(self):
+        signer = _DerBuilder.signer_info_with_algorithm(
+            _DerBuilder.SHA256,
+            _DerBuilder.rsassa_pss_algorithm('2.16.840.1.101.3.4.2.3'),
+            _DerBuilder.valid_attrs(self.CONTENT),
+        )
+
+        material = cms.extract_signer_verification_material(
+            self._embedded([signer])
+        )[0]
+
+        self.assertEqual(['incompatible_algorithms'], material.problems)
+
+    def test_detached_content_with_embedded_raises(self):
+        info = self._embedded()
+
+        self.assertRaises(
+            ValueError,
+            lambda: cms.extract_signer_verification_material(
+                info, detached_content=self.CONTENT
+            ),
+        )
+
+    def test_invalid_input_raises(self):
+        self.assertRaises(
+            ValueError,
+            lambda: cms.extract_signer_verification_material(b'\x30\x00'),
+        )
+
+    def test_pem_input(self):
+        from asn1crypto import pem
+        info = pem.armor('PKCS7', self._embedded())
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertEqual([], material.problems)
+
+    def test_multiple_signers_extracted_independently(self):
+        attrs_der = _DerBuilder.valid_attrs(self.CONTENT)
+        good = _DerBuilder.signer_info(
+            _DerBuilder.SHA256, _DerBuilder.SHA256_RSA, attrs_der
+        )
+        bad = _DerBuilder.signer_info(
+            _DerBuilder.SHA256, _DerBuilder.SHA512_RSA, attrs_der
+        )
+
+        materials = cms.extract_signer_verification_material(
+            self._embedded([good, bad])
+        )
+
+        self.assertEqual(2, len(materials))
+        self.assertEqual([], materials[0].problems)
+        self.assertEqual(['incompatible_algorithms'], materials[1].problems)
+
+    def test_real_fixture_material_is_complete_but_not_verified(self):
+        from asn1crypto import pem
+        with open(os.path.join(fixtures_dir, 'cms-signed.pem'), 'rb') as f:
+            info = f.read()
+
+        material = cms.extract_signer_verification_material(info)[0]
+
+        self.assertEqual([], material.problems)
+        self.assertEqual(b'\x31', material.verification_input[0:1])
+        self.assertEqual(256, len(material.signature))
+        self.assertEqual(material.content_digest, material.message_digest)
+        # Parsing never claims the signature itself is valid
+        self.assertFalse(hasattr(material, 'valid'))
