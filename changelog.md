@@ -1,5 +1,17 @@
 # changelog
 
+## Unreleased
+
+- Added `ocsp.assess_ocsp_response()` to correlate an `OCSPResponse` with a
+  target certificate, issuer certificate and the original request. It matches
+  the CertID algorithm, issuerNameHash, issuerKeyHash and serial number,
+  enforces nonce policy, evaluates producedAt/thisUpdate/nextUpdate (or a
+  `max_age` limit for responses omitting nextUpdate) against an explicit
+  evaluation time with configurable clock skew, rejects contradictory
+  SingleResponses, and delegates responder signature validity and
+  authorization to an explicit callback so a callback failure can never yield
+  a trusted "good" assessment
+
 ## 1.5.1
 
  - Handle RSASSA-PSS in `keys.PrivateKeyInfo.bit_size` and
